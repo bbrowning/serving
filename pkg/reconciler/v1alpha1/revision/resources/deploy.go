@@ -186,7 +186,11 @@ func MakeDeployment(rev *v1alpha1.Revision,
 
 	podTemplateAnnotations := makeAnnotations(rev)
 	// TODO(nghia): Remove the need for this
-	podTemplateAnnotations[sidecarIstioInjectAnnotation] = "true"
+	// Set the Istio sidecar injection annotation to true only if not
+	// otherwise set by the user in the revisionTemplate
+	if _, ok := podTemplateAnnotations[sidecarIstioInjectAnnotation]; !ok {
+		podTemplateAnnotations[sidecarIstioInjectAnnotation] = "true"
+	}
 	// TODO(mattmoor): Once we have a mechanism for decorating arbitrary deployments (and opting
 	// out via annotation) we should explicitly disable that here to avoid redundant Image
 	// resources.
