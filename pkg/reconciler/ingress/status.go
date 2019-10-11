@@ -256,10 +256,11 @@ func (m *StatusProber) processWorkItem() bool {
 		m.logger.Fatalf("Unexpected work item type: want: %s, got: %s\n", "*workItem", reflect.TypeOf(obj).Name())
 	}
 
+	m.logger.Infof("!!! PROBING %s with host %s", fmt.Sprintf("http://%s:8080/", item.podIP), item.probeHost)
 	ok, err := prober.Do(
 		item.context,
 		m.transportFactory(),
-		fmt.Sprintf("http://%s/", item.podIP),
+		fmt.Sprintf("http://%s:8080/", item.podIP),
 		prober.WithHost(item.probeHost),
 		prober.ExpectsStatusCodes([]int{http.StatusOK, http.StatusMovedPermanently}),
 	)

@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strings"
 
 	"knative.dev/pkg/apis/istio/v1alpha3"
 	gatewayinformer "knative.dev/pkg/client/injection/informers/istio/v1alpha3/gateway"
@@ -37,6 +38,7 @@ import (
 	"knative.dev/pkg/tracker"
 
 	"go.uber.org/zap"
+	"knative.dev/pkg/system"
 	"knative.dev/serving/pkg/apis/networking"
 	"knative.dev/serving/pkg/apis/networking/v1alpha1"
 	"knative.dev/serving/pkg/apis/serving"
@@ -276,7 +278,11 @@ func (r *BaseIngressReconciler) reconcileIngress(ctx context.Context, ra Reconci
 	ia.GetStatus().InitializeConditions()
 	logger.Infof("Reconciling ingress: %#v", ia)
 
-	gatewayNames := qualifiedGatewayNamesFromContext(ctx)
+	gatewayNames, err := r.qualifiedGatewayNamesFromContextAndIngress(ctx, ia)
+	if err != nil {
+		return err
+	}
+
 	vses, err := resources.MakeVirtualServices(ia, gatewayNames)
 	if err != nil {
 		return err
@@ -309,19 +315,22 @@ func (r *BaseIngressReconciler) reconcileIngress(ctx context.Context, ra Reconci
 			return err
 		}
 
-		for _, gw := range config.FromContext(ctx).Istio.IngressGateways {
-			ns, err := resources.ServiceNamespaceFromURL(gw.ServiceURL)
-			if err != nil {
-				return err
-			}
-			desired, err := resources.MakeTLSServers(ia, ns, originSecrets)
-			if err != nil {
-				return err
-			}
-			if err := r.reconcileGateway(ctx, ia, gw, desired); err != nil {
-				return err
-			}
-		}
+		// TODO: This all needs to change to support multiple istio
+		// control planes
+		//
+		// for _, gw := range config.FromContext(ctx).Istio.IngressGateways {
+		// 	ns, err := resources.ServiceNamespaceFromURL(gw.ServiceURL)
+		// 	if err != nil {
+		// 		return err
+		// 	}
+		// 	desired, err := resources.MakeTLSServers(ia, ns, originSecrets)
+		// 	if err != nil {
+		// 		return err
+		// 	}
+		// 	if err := r.reconcileGateway(ctx, ia, gw, desired); err != nil {
+		// 		return err
+		// 	}
+		// }
 	}
 
 	// Update status
@@ -340,9 +349,23 @@ func (r *BaseIngressReconciler) reconcileIngress(ctx context.Context, ra Reconci
 		lbReady = lbReady && ready
 	}
 	if lbReady {
-		lbs := getLBStatus(gatewayServiceURLFromContext(ctx, ia))
-		publicLbs := getLBStatus(publicGatewayServiceURLFromContext(ctx))
-		privateLbs := getLBStatus(privateGatewayServiceURLFromContext(ctx))
+		lbURL, err := r.gatewayServiceURLFromContext(ctx, ia)
+		if err != nil {
+			return fmt.Errorf("failed to lookup Gateway for Ingress %s/%s: %v", ia.GetNamespace(), ia.GetName(), err)
+		}
+		lbs := getLBStatus(lbURL)
+
+		publicLbURL, err := r.publicGatewayServiceURLFromContext(ctx, ia)
+		if err != nil {
+			return fmt.Errorf("failed to lookup public Gateway for Ingress %s/%s: %v", ia.GetNamespace(), ia.GetName(), err)
+		}
+		publicLbs := getLBStatus(publicLbURL)
+
+		privateLbURL, err := r.privateGatewayServiceURLFromContext(ctx, ia)
+		if err != nil {
+			return fmt.Errorf("failed to lookup private Gateway for Ingress %s/%s: %v", ia.GetNamespace(), ia.GetName(), err)
+		}
+		privateLbs := getLBStatus(privateLbURL)
 
 		ia.GetStatus().MarkLoadBalancerReady(lbs, publicLbs, privateLbs)
 	} else {
@@ -541,6 +564,94 @@ func (r *BaseIngressReconciler) GetVirtualServiceLister() istiolisters.VirtualSe
 	return r.VirtualServiceLister
 }
 
+func (r *BaseIngressReconciler) controlPlaneNamespace(ia v1alpha1.IngressAccessor) (string, error) {
+	iaNamespace, err := r.KubeClientSet.CoreV1().Namespaces().Get(ia.GetNamespace(), metav1.GetOptions{})
+	if err != nil {
+		return "", err
+	}
+
+	return iaNamespace.GetLabels()["maistra.io/member-of"], nil
+}
+
+// qualifiedGatewayNamesFromContext get gateway names from context and
+// ingress by respecting the service mesh multitenancy
+func (r *BaseIngressReconciler) qualifiedGatewayNamesFromContextAndIngress(ctx context.Context, ia v1alpha1.IngressAccessor) (map[v1alpha1.IngressVisibility]sets.String, error) {
+	gatewayNames := qualifiedGatewayNamesFromContext(ctx)
+
+	cpNamespace, err := r.controlPlaneNamespace(ia)
+	if err != nil {
+		return gatewayNames, err
+	}
+	if cpNamespace != "" {
+		for _, name := range gatewayNames[v1alpha1.IngressVisibilityExternalIP].List() {
+			gatewayNames[v1alpha1.IngressVisibilityExternalIP].Delete(name)
+			gatewayNames[v1alpha1.IngressVisibilityExternalIP].Insert(strings.Replace(name, system.Namespace(), cpNamespace, 1))
+		}
+		for _, name := range gatewayNames[v1alpha1.IngressVisibilityClusterLocal].List() {
+			gatewayNames[v1alpha1.IngressVisibilityClusterLocal].Delete(name)
+			gatewayNames[v1alpha1.IngressVisibilityClusterLocal].Insert(strings.Replace(name, system.Namespace(), cpNamespace, 1))
+		}
+	}
+
+	return gatewayNames, nil
+}
+
+// gatewayServiceURLFromContext return an address of a load-balancer
+// that the given Ingress is exposed to, or empty string if
+// none.
+func (r *BaseIngressReconciler) gatewayServiceURLFromContext(ctx context.Context, ia v1alpha1.IngressAccessor) (string, error) {
+	if ia.IsPublic() {
+		return r.publicGatewayServiceURLFromContext(ctx, ia)
+	}
+
+	return r.privateGatewayServiceURLFromContext(ctx, ia)
+}
+
+func (r *BaseIngressReconciler) publicGatewayServiceURLFromContext(ctx context.Context, ia v1alpha1.IngressAccessor) (string, error) {
+	cfg := config.FromContext(ctx).Istio
+	if len(cfg.IngressGateways) > 0 {
+		serviceURL := cfg.IngressGateways[0].ServiceURL
+		cpNamespace, err := r.controlPlaneNamespace(ia)
+		if err != nil {
+			return "", err
+		}
+		if cpNamespace != "" {
+			return replaceNamespaceInURL(serviceURL, cpNamespace)
+		}
+		return serviceURL, nil
+	}
+
+	return "", nil
+}
+
+func (r *BaseIngressReconciler) privateGatewayServiceURLFromContext(ctx context.Context, ia v1alpha1.IngressAccessor) (string, error) {
+	cfg := config.FromContext(ctx).Istio
+	if len(cfg.LocalGateways) > 0 {
+		serviceURL := cfg.LocalGateways[0].ServiceURL
+		cpNamespace, err := r.controlPlaneNamespace(ia)
+		if err != nil {
+			return "", err
+		}
+		if cpNamespace != "" {
+			return replaceNamespaceInURL(serviceURL, cpNamespace)
+		}
+		return serviceURL, nil
+	}
+
+	return "", nil
+}
+
+// replaceNamespaceInURL replaces the namespace part of a service URL
+// with the passed-in namespace
+func replaceNamespaceInURL(svc string, namespace string) (string, error) {
+	parts := strings.SplitN(svc, ".", 3)
+	if len(parts) != 3 {
+		return "", fmt.Errorf("unexpected service URL form: %s", svc)
+	}
+	parts[1] = namespace
+	return strings.Join(parts, "."), nil
+}
+
 // qualifiedGatewayNamesFromContext get gateway names from context
 func qualifiedGatewayNamesFromContext(ctx context.Context) map[v1alpha1.IngressVisibility]sets.String {
 	publicGateways := sets.NewString()
@@ -557,35 +668,6 @@ func qualifiedGatewayNamesFromContext(ctx context.Context) map[v1alpha1.IngressV
 		v1alpha1.IngressVisibilityExternalIP:   publicGateways,
 		v1alpha1.IngressVisibilityClusterLocal: privateGateways,
 	}
-}
-
-// gatewayServiceURLFromContext return an address of a load-balancer
-// that the given Ingress is exposed to, or empty string if
-// none.
-func gatewayServiceURLFromContext(ctx context.Context, ia v1alpha1.IngressAccessor) string {
-	if ia.IsPublic() {
-		return publicGatewayServiceURLFromContext(ctx)
-	}
-
-	return privateGatewayServiceURLFromContext(ctx)
-}
-
-func publicGatewayServiceURLFromContext(ctx context.Context) string {
-	cfg := config.FromContext(ctx).Istio
-	if len(cfg.IngressGateways) > 0 {
-		return cfg.IngressGateways[0].ServiceURL
-	}
-
-	return ""
-}
-
-func privateGatewayServiceURLFromContext(ctx context.Context) string {
-	cfg := config.FromContext(ctx).Istio
-	if len(cfg.LocalGateways) > 0 {
-		return cfg.LocalGateways[0].ServiceURL
-	}
-
-	return ""
 }
 
 // getLBStatus get LB Status
