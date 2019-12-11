@@ -198,7 +198,7 @@ func MainWithConfig(ctx context.Context, component string, cfg *rest.Config, cto
 	profilingServer := profiling.NewServer(profilingHandler)
 
 	eg, egCtx := errgroup.WithContext(ctx)
-	eg.Go(profilingServer.ListenAndServe)
+	// eg.Go(profilingServer.ListenAndServe)
 
 	// If we have one or more admission controllers, then start the webhook
 	// and pass them in.

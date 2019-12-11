@@ -157,7 +157,7 @@ func main() {
 	// Set up a signal context with our webhook options
 	ctx := webhook.WithOptions(signals.NewContext(), webhook.Options{
 		ServiceName: "webhook",
-		Port:        8443,
+		Port:        8444,
 		SecretName:  "webhook-certs",
 	})
 

@@ -1,0 +1,238 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: 3scale-kourier-gateway
+  namespace: knative-serving
+  labels:
+    serving.knative.dev/release: devel
+spec:
+  selector:
+    matchLabels:
+      app: 3scale-kourier-gateway
+  template:
+    metadata:
+      annotations:
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+        sidecar.istio.io/inject: "false"
+      labels:
+        app: 3scale-kourier-gateway
+        serving.knative.dev/release: devel
+    spec:
+      serviceAccountName: controller
+      # We want to give Activator quite some to exit, to process the existing requests
+      # which might be quite long running, i.e. streaming.
+      terminationGracePeriodSeconds: 300
+      containers:
+      - name: activator
+        # This is the Go import path for the binary that is containerized
+        # and substituted here.
+        image: knative.dev/serving/cmd/activator
+        env:
+          # Run Activator with GC collection when newly generated memory is 500%
+          - name: GOGC
+            value: 500
+        ports:
+        - name: http1
+          containerPort: 8012
+        - name: h2c
+          containerPort: 8013
+        - name: metrics
+          containerPort: 9090
+        - name: profiling
+          containerPort: 8008
+        readinessProbe:
+          httpGet:
+            # The path does not matter, we look for the kubelet user-agent
+            # (or our header below)
+            path: /healthz
+            port: 8012
+            httpHeaders:
+            # Istio with mTLS strips the Kubelet user-agent, so pass a header too.
+            - name: k-kubelet-probe
+              value: "activator"
+        livenessProbe:
+          httpGet:
+            # The path does not matter, we look for kubelet probe headers.
+            path: /healthz
+            port: 8012
+            httpHeaders:
+            # Istio with mTLS strips the Kubelet user-agent, so pass a header too.
+            - name: k-kubelet-probe
+              value: "activator"
+        resources:
+          # The numbers are based on performance test results from
+          # https://github.com/knative/serving/issues/1625#issuecomment-511930023
+          requests:
+            cpu: 300m
+            memory: 60Mi
+          limits:
+            cpu: 1000m
+            memory: 600Mi
+        env:
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          - name: SYSTEM_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+          - name: CONFIG_LOGGING_NAME
+            value: config-logging
+          - name: CONFIG_OBSERVABILITY_NAME
+            value: config-observability
+          # Used for Stackdriver only.
+          - name: METRICS_DOMAIN
+            value: knative.dev/internal/serving
+        securityContext:
+          allowPrivilegeEscalation: false
+      - name: kourier-gateway
+        image: quay.io/3scale/kourier-gateway:v0.1.2
+        args:
+          - -c
+          - /tmp/config/envoy-bootstrap.yaml
+        ports:
+          - containerPort: 8080
+            protocol: TCP
+        resources: {}
+        volumeMounts:
+          - name: config-volume
+            mountPath: /tmp/config
+        readinessProbe:
+          exec:
+            command: ['ash','-c','(printf "GET /__internalkouriersnapshot HTTP/1.1\r\nHost: internalkourier\r\n\r\n"; sleep 1) | nc -n localhost 8081 | grep "HTTP/1.1 200 OK"']
+          initialDelaySeconds: 5
+          periodSeconds: 2
+      volumes:
+        - name: config-volume
+          configMap:
+            name: kourier-bootstrap
+---
+apiVersion: autoscaling/v2beta1
+kind: HorizontalPodAutoscaler
+metadata:
+  name: activator
+  namespace: knative-serving
+  labels:
+    serving.knative.dev/release: devel
+spec:
+    minReplicas: 1
+    maxReplicas: 20
+    scaleTargetRef:
+      apiVersion: apps/v1
+      kind: Deployment
+      name: 3scale-kourier-gateway
+    metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        # Percentage of the requested CPU
+        targetAverageUtilization: 100
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kourier
+  namespace: knative-serving
+spec:
+  ports:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: 8080
+  selector:
+    app: 3scale-kourier-gateway
+  type: LoadBalancer
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kourier-internal
+  namespace: knative-serving
+spec:
+  ports:
+    - name: http2
+      port: 80
+      protocol: TCP
+      targetPort: 8081
+  selector:
+    app: 3scale-kourier-gateway
+  type: LoadBalancer
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kourier-external
+  namespace: knative-serving
+spec:
+  ports:
+    - name: http2
+      port: 80
+      protocol: TCP
+      targetPort: 8080
+  selector:
+    app: 3scale-kourier-gateway
+  type: LoadBalancer
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kourier-control
+  namespace: knative-serving
+spec:
+  ports:
+    - port: 18000
+      protocol: TCP
+      targetPort: 18000
+  selector:
+    app: controller
+  type: LoadBalancer
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kourier-bootstrap
+  namespace: knative-serving
+data:
+  envoy-bootstrap.yaml: |
+    admin:
+      access_log_path: /tmp/test
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 19000
+    dynamic_resources:
+      ads_config:
+        api_type: GRPC
+        grpc_services:
+          - envoy_grpc:
+              cluster_name: xds_cluster
+      cds_config:
+        ads: {}
+      lds_config:
+        ads: {}
+    node:
+      cluster: kourier-knative
+      id: 3scale-kourier-gateway
+    static_resources:
+      clusters:
+        - connect_timeout: 0.2s
+          load_assignment:
+            cluster_name: xds_cluster
+            endpoints:
+              - lb_endpoints:
+                - endpoint:
+                    address:
+                      socket_address:
+                        address: kourier-control
+                        port_value: 18000
+          http2_protocol_options: {}
+          upstream_connection_options:
+            tcp_keepalive: {}
+          lb_policy: ROUND_ROBIN
+          name: xds_cluster
+          type: STRICT_DNS
